@@ -258,6 +258,44 @@ No `Unknown function is used with vkGetInstanceProcAddr/vkGetDeviceProcAddr` lin
 - `test31_sparse_trace` still crashes on first sparse call:
   - prints `T31 before first call` then `Segmentation fault (core dumped)`.
 
+## 2026-02-18 Follow-up: missing API path still gated by internal tree lookup
+
+- Fixed `run_vk_arm_tests_waydroid.sh` return-code parsing to capture in-container rc via marker (`__WAYDROID_TEST_RC__`) so failures are not masked as pass.
+- Verified on native host Vulkan (RADV) that these APIs are present and non-null:
+  - `vkGetPhysicalDeviceSparseImageFormatProperties`
+  - `vkGetPhysicalDeviceCalibrateableTimeDomainsEXT`
+  - `vkGetDeviceFaultInfoEXT`
+  - `vkCmdWriteAccelerationStructuresPropertiesKHR`
+- In Waydroid/proxy path, focused probes still report null:
+  - `vkGetPhysicalDeviceCalibrateableTimeDomainsEXT=0x0`
+  - `vkGetDeviceFaultInfoEXT=0x0`
+  - `vkCmdWriteAccelerationStructuresPropertiesKHR=0x0`
+  - `vkGetPhysicalDeviceSparseImageFormatProperties=0x0`
+- Logcat still shows:
+  - `Unknown function is used with vkGetInstanceProcAddr: ...` for the above names.
+
+### Patch attempts this round
+
+- Re-tested name/wrapper table patching on `.proxy_patch`-extended proxy for:
+  - `0x96998` only
+  - full 547-entry rewrite at `0x96768`
+  - dual-table script variant
+- None changed runtime outcome for these names after full restart.
+- Cause: table-only edits are not sufficient for this code path.
+
+### New reverse-engineering finding
+
+- Unknown-function branch traced to internal lookup routines around:
+  - `0x30f20` and `0x88a20`
+- These paths call comparator/helper code and emit the `%s` unknown log, then force null return.
+- This indicates an additional internal registration/tree gate beyond simple static table edits.
+
+### Current stable state
+
+- Restored proxy to stable baseline hash:
+  - `0fe25a28238b0714d255e5245630059ee40151505d711b6789e9d1393040d1ca`
+- No destructive changes left active from failed patch attempts.
+
 ## 2026-02-17 SIMD step 1: `.2d` `1/sqrt(x)` baseline
 
 - Added ARM64 validation binary:
@@ -855,3 +893,39 @@ Patched file hash:
 ### 14.4 Interpretation
 - For this checkpoint, Vulkan translation/proxy path is stable under the probe suite.
 - The demo still stalls after startup, and current visible blocker is in app content/bootstrap path rather than an immediate Vulkan proc-resolution or translator crash.
+
+## 2026-02-18: Sparse-old stabilization (working state)
+
+### Facts captured
+
+- Native host baseline (`vk_arm_tests/bin/test38_sparse_api_check_host`) is stable and returns valid sparse data.
+- In Waydroid proxy path, sparse-old lookup is resolved through multiple table regions, not only one:
+  - `0x92220`
+  - `0x96318`
+  - `0x96768`
+  - `0x96998`
+- A sparse-old no-op handler (`ret`) wired to all these rows is sufficient to stop crashes in sparse-old probes.
+
+### Implemented
+
+- Added findings doc:
+  - `sparse_old_argbuf_mapping.md`
+- Added reproducible safe patch script:
+  - `patch-proxy-sparse-old-safe.sh`
+  - behavior:
+    - enforces sparse-old name string
+    - allocates a tiny `ret` handler in `.proxy_patch` RX section
+    - patches all sparse-old rows across the 4 known table regions to this handler
+
+### Validation
+
+- Full suite run after patch:
+  - `vk_arm_tests/out/summary_waydroid_20260218_202413.md`
+  - result: `42/44 PASS`
+  - remaining fails are host-only binaries not present inside Waydroid (`*_host`, rc=126)
+- Sparse-old specific tests now pass in Waydroid:
+  - `test30_call_sparse_non2`
+  - `test31_sparse_trace`
+  - `test38_sparse_api_check`
+  - `test39_unimplemented_api_safety`
+  - `test41_sparse_dlsym_invoke`

@@ -57,6 +57,27 @@ show_status() {
   fi
 }
 
+verify_rx_layout() {
+  local f
+  f="${1:-$PATCHED_LIB}"
+  if [[ ! -f "$f" ]]; then
+    echo "missing file: $f" >&2
+    exit 1
+  fi
+  echo "[*] Verifying extended RX layout in: $f"
+  readelf -W -S "$f" | rg -q '\.proxy_patch.* AX ' || {
+    echo "ERROR: .proxy_patch not present as AX section" >&2
+    exit 1
+  }
+  readelf -W -l "$f" | rg -q 'LOAD +0x0a4000 .* R E ' || {
+    echo "ERROR: expected RX PT_LOAD for .proxy_patch not found" >&2
+    exit 1
+  }
+  readelf -W -S "$f" | rg -n '\.proxy_patch|\.text'
+  readelf -W -l "$f" | sed -n '1,120p'
+  echo "[*] RX verification passed"
+}
+
 sync_original() {
   echo "[*] Syncing pristine original from system -> workspace"
   sudo cp -a "$SYSTEM_LIB" "$ORIG_LIB"
@@ -211,9 +232,9 @@ case "$ACTION" in
   build) build_patched ;;
   install) install_patched ;;
   status) show_status ;;
+  verify-rx) verify_rx_layout "${2:-$PATCHED_LIB}" ;;
   *)
-    echo "Usage: $0 [sync-original|build|install|status]" >&2
+    echo "Usage: $0 [sync-original|build|install|status|verify-rx [file]]" >&2
     exit 1
     ;;
 esac
-
