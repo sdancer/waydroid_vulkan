@@ -17,14 +17,13 @@ set -euo pipefail
 #   VNC_USERNAME (default: waydroid)
 #   VNC_PASSWORD (default: waydroid)
 #   VNC_OUTPUT   (default: HEADLESS-1)
-#   WAYLAND_DISPLAY (default: wayland-0)
 
 ACTION="${1:-start}"
 WIDTH="${2:-1920}"
 HEIGHT="${3:-1080}"
 PORT="${4:-5900}"
 
-SOCKET_NAME="${WAYLAND_DISPLAY:-wayland-0}"
+SOCKET_NAME="wayland-0"
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 RUNTIME_DIR="${XDG_RUNTIME_DIR}/waydroid-vnc"
 
@@ -59,19 +58,31 @@ cleanup_stale() {
     "${XDG_RUNTIME_DIR}/${SOCKET_NAME}" \
     "${XDG_RUNTIME_DIR}/${SOCKET_NAME}.lock" \
     "${XDG_RUNTIME_DIR}/wayland-0" \
-    "${XDG_RUNTIME_DIR}/wayland-0.lock" \
-    "${XDG_RUNTIME_DIR}/wayland-1" \
-    "${XDG_RUNTIME_DIR}/wayland-1.lock" || true
+    "${XDG_RUNTIME_DIR}/wayland-0.lock" || true
 }
 
-ensure_wayland_aliases() {
-  # Waydroid hwcomposer commonly tries wayland-0 regardless of host env.
-  # Keep wayland-0 available even when running sway on another socket name.
-  if [ "$SOCKET_NAME" != "wayland-0" ]; then
-    ln -sfn "${XDG_RUNTIME_DIR}/${SOCKET_NAME}" "${XDG_RUNTIME_DIR}/wayland-0"
+stop_wayland0_owners() {
+  local sock="${XDG_RUNTIME_DIR}/wayland-0"
+  local pids=""
+
+  # Best effort: stop Waydroid first so hwcomposer releases the socket.
+  waydroid session stop >/dev/null 2>&1 || true
+
+  if [ -S "$sock" ]; then
+    if command -v fuser >/dev/null 2>&1; then
+      pids="$(fuser "$sock" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true)"
+    elif command -v lsof >/dev/null 2>&1; then
+      pids="$(lsof -t "$sock" 2>/dev/null | sort -u || true)"
+    fi
   fi
-  if [ "$SOCKET_NAME" != "wayland-1" ]; then
-    ln -sfn "${XDG_RUNTIME_DIR}/${SOCKET_NAME}" "${XDG_RUNTIME_DIR}/wayland-1"
+
+  if [ -n "$pids" ]; then
+    echo "Stopping existing wayland-0 owners: $pids"
+    # shellcheck disable=SC2086
+    kill $pids >/dev/null 2>&1 || true
+    sleep 1
+    # shellcheck disable=SC2086
+    kill -9 $pids >/dev/null 2>&1 || true
   fi
 }
 
@@ -99,6 +110,7 @@ start_sway() {
   mkdir -p "$RUNTIME_DIR"
   chmod 700 "$RUNTIME_DIR"
 
+  stop_wayland0_owners
   cleanup_stale
 
   # Start sway in headless mode.
@@ -107,16 +119,17 @@ start_sway() {
 
   # Wait for WAYLAND socket.
   if ! wait_for_file "${XDG_RUNTIME_DIR}/${SOCKET_NAME}" 80 0.1; then
-    # Some sway builds still create wayland-1 even with WAYLAND_DISPLAY set.
-    if [ -S "${XDG_RUNTIME_DIR}/wayland-1" ]; then
-      SOCKET_NAME="wayland-1"
+    # Some sway/wlroots builds pick an auto socket name; expose it as wayland-0.
+    local alt_socket=""
+    alt_socket="$(ls -1t "${XDG_RUNTIME_DIR}"/wayland-* 2>/dev/null | head -n1 || true)"
+    if [ -n "$alt_socket" ] && [ -S "$alt_socket" ]; then
+      ln -sfn "$alt_socket" "${XDG_RUNTIME_DIR}/${SOCKET_NAME}"
     else
       echo "Sway socket not created: ${XDG_RUNTIME_DIR}/${SOCKET_NAME}" >&2
       echo "Check log: $SWAY_LOG" >&2
       exit 1
     fi
   fi
-  ensure_wayland_aliases
 
   # Wait for sway IPC socket path. `sway --get-socketpath` may fail outside
   # the compositor environment, so also scan runtime dir as fallback.
