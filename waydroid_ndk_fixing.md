@@ -929,3 +929,218 @@ Patched file hash:
   - `test38_sparse_api_check`
   - `test39_unimplemented_api_safety`
   - `test41_sparse_dlsym_invoke`
+
+## Follow-up 15: Stall boundary vs native + dump validation script (2026-02-18)
+
+### 15.1 Current divergence (fact-based)
+
+- Native reference run reaches:
+  - `LogAssetRegistry: AssetRegistryGather time ...`
+  - `LogAssetRegistry: Display: Starting OnFilesLoaded.Broadcast`
+  - `LogAssetRegistry: Display: Completed OnFilesLoaded.Broadcast`
+  - `LogInit: Display: Engine is initialized. Leaving FEngineLoop::Init()`
+  - `LogLoad: (Engine Initialization) Total time: ...`
+- Waydroid run does **not** reach those lines in current state.
+- Waydroid progresses through:
+  - Vulkan detected and enabled
+  - Pak/utoc mount
+  - asset registry preload (`Premade AssetRegistry loaded`)
+  - Vulkan device creation and full device-extension enumeration
+- Then it stalls with heartbeat logs (`NetworkChangedManager`) and no crash/tombstone.
+
+### 15.2 Current error signatures in Waydroid dump
+
+- Present:
+  - `ndk_translation: Unknown function is used with vkGetInstanceProcAddr: vkCmdWriteAccelerationStructuresPropertiesKHR`
+  - `ndk_translation: Unknown function is used with vkGetInstanceProcAddr: vkGetPhysicalDeviceCalibrateableTimeDomainsEXT`
+  - `ndk_translation: Unknown function is used with vkGetInstanceProcAddr: vkGetDeviceFaultInfoEXT`
+- Not present in this checkpoint:
+  - unknown instruction / unsupported instruction
+  - tombstone / fatal UE assertion
+
+### 15.3 New checker script (documents important lines)
+
+- Added script:
+  - `/home/sdancer/wd/check_ue_dump_expectations.sh`
+- Purpose:
+  - validates expected milestone lines from dump files,
+  - flags forbidden signatures that should not appear.
+- Profiles:
+  - `full-init` (Waydroid Android dump expectations + full engine-init lines)
+  - `boot` (Waydroid Android boot milestones only)
+  - `native-full-init` (native Linux UE dump expectations)
+
+### 15.4 Known outputs
+
+- Native reference:
+  - `./check_ue_dump_expectations.sh --profile native-full-init /tmp/ue_native_sway.log`
+  - `RESULT: PASS`
+- Current Waydroid stalled run:
+  - `./check_ue_dump_expectations.sh --profile full-init /tmp/ue_waydroid_latest.log`
+  - `RESULT: FAIL`
+  - missing full-init milestones + forbidden unknown-vkGetInstanceProcAddr signatures.
+
+## 2026-02-19 Follow-up 16: verified missing3 path bypasses proxy dispatch-table aliases
+
+### Goal
+Validate whether adding in-place aliases for these missing names inside `libndk_translation_proxy_libvulkan.so` tables can clear runtime `vkGetInstanceProcAddr` unknown lines:
+- `vkCmdWriteAccelerationStructuresPropertiesKHR`
+- `vkGetPhysicalDeviceCalibrateableTimeDomainsEXT`
+- `vkGetDeviceFaultInfoEXT`
+
+### What was implemented
+- Added new script:
+  - `/home/sdancer/wd/patch-proxy-missing3-inplace-safe.sh`
+- Script behavior:
+  - Injects missing names into `.proxy_patch` (VA-based pointers).
+  - Repoints selected donor rows in-place (no global sorting/reordering).
+  - Copies wrappers from existing implemented APIs:
+    - `vkCmdTraceRaysIndirect2KHR`
+    - `vkGetPhysicalDeviceToolPropertiesEXT`
+    - `vkGetDeviceGroupSurfacePresentModes2EXT`
+
+### Controlled test
+1. Baseline with stable proxy hash `a6def8ccdf0847c5fb92de1ad08a663e29b102611e390b7c934afda353313bb9`:
+   - Ran `test40_missing3_call_paths` in Waydroid.
+   - Result: all 3 functions `pfn=0x0`, status `MISSING_SAFE`.
+   - Logcat shows all 3 unknown lines from `ndk_translation`.
+2. Applied in-place alias patch to live overlay proxy (hash became `287f3f2d272c192927f79a35a42f235d867f145be12e1209f319cc0ed9032c35`), restarted Waydroid, reran same test.
+   - Result unchanged: all 3 still `pfn=0x0`, same unknown logcat lines.
+3. Rolled back overlay proxy to stable hash `a6def8...`.
+
+### Conclusion
+- The runtime path producing these 3 unknowns is **not resolved by the proxy dispatch-table aliasing** currently patched.
+- This strongly indicates the active lookup/check for these names occurs in `libndk_translation.so` logic (or another path upstream of proxy table rows), not in the specific proxy table entries we modified.
+
+### Impact on next work
+- Keep proxy at stable baseline (`a6def8...`) to avoid no-op risk.
+- Next actionable direction is patching/interposing the `libndk_translation.so` unknown-name handling path directly (name allowlist/dispatch logic), then re-validating with `test40_missing3_call_paths` and UE demo startup logs.
+
+## 2026-02-19 Follow-up 17: active unknown path mapped to .text@0x30f7d and relocation-backed table behavior
+
+### Verified facts
+- Live proxy restored and stable:
+  - `/var/lib/waydroid/overlay/system/lib64/libndk_translation_proxy_libvulkan.so`
+  - SHA256: `a6def8ccdf0847c5fb92de1ad08a663e29b102611e390b7c934afda353313bb9`
+- `test40_missing3_call_paths` still reproduces:
+  - all 3 names `pfn=0x0`
+  - logcat unknown lines via `vkGetInstanceProcAddr`
+
+### Source-of-log proof
+- Patched proxy rodata format string at offset `0x7fe4` (VA `0x7fe4`) to marker `PTEST vkGIPA unknown: %s`.
+- Logcat reflected the marker immediately.
+- Conclusion: unknown logs are emitted by `libndk_translation_proxy_libvulkan.so` (not a different library).
+
+### Active callsite isolation
+- Repointing callsite format operand at `.text@0x30f7d` from GIPA format (`0x7fe4`) to GDPA format (`0xa974`) changed emitted lines to:
+  - `Unknown function is used with vkGetDeviceProcAddr: ...`
+- Therefore the active unknown branch for this path is the block around `.text@0x30f6c..0x30f96`.
+
+### Why previous table patches did not affect runtime
+- The currently active unknown branch in this build does **not** consume only the simple static table edits we patched earlier.
+- Multiple lookup paths and relocation-backed data regions are involved in this binary; offline row edits in one candidate table were not sufficient to alter runtime resolution in the active branch.
+- This explains repeated behavior: patched rows present on disk but runtime still returns `pfn=0x0` for the 3 names.
+
+### Practical next patch target
+- Patch the active branch logic itself (around `.text@0x30eb0..0x30f9a`) by pre-search aliasing of requested names before binary search.
+- This bypasses dependency on table-row mutation persistence and is the most direct way to force deterministic lookup behavior for the 3 names.
+
+## 2026-02-19 Follow-up 18: unknown-branch hook attempts and why they fail
+
+### Attempt A: alias/retry from unknown branch
+- Hooked active unknown branch at `.text@0x30f6c` and jumped to `.proxy_patch` cave.
+- Cave compared queried name and remapped to known names, then jumped back to retry search (`0x30ec5`).
+
+Observed result:
+- Immediate crash in `DoCustomTrampolineWithThunk_vkGetInstanceProcAddr` at `0x30f4f` (`call rax`).
+- Tombstone showed `rip` inside non-executable low-offset area (`+0x89e0`) indicating invalid thunk target in this path for these names.
+
+Interpretation:
+- For these missing names, entering the normal success path triggers a bad thunk pointer in this build.
+- So name aliasing alone is insufficient.
+
+### Attempt B: return raw local stubs from unknown branch
+- Same hook point (`0x30f6c`), but returned local cave stubs via `r15` directly and jumped to epilogue (`0x30f9a`).
+
+Observed result:
+- `test40_missing3_call_paths` first line changed to non-null PFN for first API.
+- Then call hung and test timed out.
+
+Interpretation:
+- Returning raw host-side cave function pointers is not ABI-safe for translated ARM guest call paths (requires proper trampoline creation flow).
+
+### Current conclusion
+- The correct fix must integrate with the proper trampoline/thunk metadata path, not only patch unknown-name logging branch.
+- Specifically, we need either:
+  1. a valid thunk+wrapper metadata entry for each missing API in the active runtime structures, or
+  2. patch in the caller path that builds/chooses thunk metadata so these names get a valid callable trampoline.
+
+### Safety/state
+- Live proxy was reverted to stable baseline after each experiment.
+- Current live SHA256:
+  - `a6def8ccdf0847c5fb92de1ad08a663e29b102611e390b7c934afda353313bb9`
+
+## 2026-02-19 Follow-up 19: attempted table extension in `.proxy_patch` failed due missing relocations
+
+### What was attempted
+- Added script: `patch-proxy-gipa-extend-table.sh`.
+- Strategy:
+  - Build a new 550-entry table (+3 missing APIs) in `.proxy_patch`.
+  - Patch active GIPA lookup routine (`0x30eb0`) to use new `count/base/end`.
+  - Also tried a custom wrapper stub for `vkCmdWriteAccelerationStructuresPropertiesKHR` with explicit signature `vpipipi` in cave code.
+
+### Observed runtime failure
+- `test40_missing3_call_paths` crashed with:
+  - `DoCustomTrampolineWithThunk_vkGetInstanceProcAddr+0x5d` (`0x30f0d`), i.e. during lookup compare path.
+- This is consistent with invalid name pointer values read from the extended table.
+
+### Root cause
+- New table rows in `.proxy_patch` are **not relocation-backed**.
+- The original table pointer fields rely on loader relocations in the original relocation-covered region.
+- Copying those addends into a new section without matching relocation entries leaves pointers unrelocated at runtime.
+
+### Conclusion
+- Extending lookup table storage into `.proxy_patch` is not viable by static byte patch alone unless we also add valid dynamic relocations for each pointer field.
+- Safe state restored.
+
+### Current stable state after rollback
+- Restored live overlay proxy to known-good hash:
+  - `a6def8ccdf0847c5fb92de1ad08a663e29b102611e390b7c934afda353313bb9`
+- Re-validated `test40_missing3_call_paths`:
+  - all 3 APIs are `pfn=0x0`
+  - test passes in `MISSING_SAFE` mode (no crash)
+
+## 2026-02-19 Follow-up 20: fixed table patching bug (VA vs file offset) and landed working in-place GIPA patch
+
+### Critical bug found
+- Active table constant `0x96768` in `DoCustomTrampolineWithThunk_vkGetInstanceProcAddr` is a **virtual address**, not a raw file offset.
+- Earlier scripts wrote rows at file offset `0x96768` (wrong location).
+- Correct file offset for that VA in this ELF is `0x94768` (segment delta `VA 0x93290 -> file 0x91290`).
+
+### What changed
+- Implemented `patch-proxy-gipa-missing3-inplace-custom.sh`:
+  - patches active table at VA `0x96768` using proper VA->file mapping.
+  - injects custom wrappers in `.proxy_patch`:
+    - `vkCmdWriteAccelerationStructuresPropertiesKHR` with signature `vpipipi`
+    - `vkGetDeviceFaultInfoEXT` with signature `ippp`
+    - `vkGetPhysicalDeviceCalibrateableTimeDomainsEXT` with signature `ippp`
+  - remaps in-place donor rows at exact lower-bound positions used by the same binary-search algorithm.
+
+### Validation (Waydroid, ARM test)
+- `test40_missing3_call_paths` now reports non-null PFNs for all 3 missing APIs and completes without crash.
+- Previous unknown lines are no longer emitted for test40 path.
+
+Observed test output:
+- `vkCmdWriteAccelerationStructuresPropertiesKHR pfn=0x... status=CALL_OK`
+- `vkGetPhysicalDeviceCalibrateableTimeDomainsEXT pfn=0x... status=CALL_OK ...`
+- `vkGetDeviceFaultInfoEXT pfn=0x... status=CALL_OK ...`
+- `PASS test40_missing3_call_paths`
+
+### Current live proxy hash
+- `/var/lib/waydroid/overlay/system/lib64/libndk_translation_proxy_libvulkan.so`
+- SHA256: `d073fbc751a22fd0d23120fef169c3fa32b34b892f28bc5d5c4db08383e3f18f`
+
+### Note on "relocating full table to .proxy_patch"
+- This binary uses Android packed relocations (`DT_ANDROID_RELA*`), not plain `DT_RELA`.
+- Full table relocation into new section would require rebuilding packed relocation payloads.
+- In-place patching of already-relocated slots avoids that complexity and is now functioning.
