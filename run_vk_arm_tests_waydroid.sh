@@ -31,6 +31,10 @@ pass=0
 fail=0
 
 for host_bin in "${BIN_DIR}"/test*; do
+  # Host-only probes are not executable in Waydroid ARM environment.
+  if [[ "$(basename "${host_bin}")" == *_host ]]; then
+    continue
+  fi
   name="$(basename "${host_bin}")"
   total=$((total + 1))
 
