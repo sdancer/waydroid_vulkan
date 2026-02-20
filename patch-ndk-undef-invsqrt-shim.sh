@@ -4,6 +4,7 @@ set -euo pipefail
 LIB="${LIB:-/var/lib/waydroid/overlay/system/lib64/libndk_translation.so}"
 ACTION="${1:-apply}"
 CAVE_VA="${CAVE_VA:-0x300800}"
+SKIP_MPROTECT="${SKIP_MPROTECT:-0}"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need_cmd python3
@@ -39,7 +40,7 @@ apply_patch() {
   echo "[*] Backup: $backup"
   sudo cp -a "$LIB" "$backup"
 
-  sudo python3 - "$LIB" "$sva" "$CAVE_VA" <<'PY'
+  sudo python3 - "$LIB" "$sva" "$CAVE_VA" "$SKIP_MPROTECT" <<'PY'
 import struct
 import sys
 from pathlib import Path
@@ -47,6 +48,7 @@ from pathlib import Path
 lib = Path(sys.argv[1])
 func_va = int(sys.argv[2], 16)
 cave_va = int(sys.argv[3], 0)
+skip_mprotect = int(sys.argv[4]) != 0
 b = bytearray(lib.read_bytes())
 
 if b[:4] != b'\x7fELF' or b[4] != 2 or b[5] != 1:
@@ -83,14 +85,15 @@ labels = {}
 
 code += bytes.fromhex('53')                        # push rbx
 code += bytes.fromhex('4889fb')                    # mov rbx,rdi
-code += bytes.fromhex('4881e700f0ffff')            # and rdi,0xfffffffffffff000
-code += bytes.fromhex('be00100000')                # mov esi,0x1000
-code += bytes.fromhex('ba07000000')                # mov edx,0x7
-code += bytes.fromhex('b80a000000')                # mov eax,0xa
-code += bytes.fromhex('0f05')                      # syscall (mprotect)
-code += bytes.fromhex('85c0')                      # test eax,eax
-code += bytes.fromhex('0f8500000000')              # jne done
-fixups.append((len(code) - 4, 'done'))
+if not skip_mprotect:
+    code += bytes.fromhex('4881e700f0ffff')        # and rdi,0xfffffffffffff000
+    code += bytes.fromhex('be00100000')            # mov esi,0x1000
+    code += bytes.fromhex('ba07000000')            # mov edx,0x7
+    code += bytes.fromhex('b80a000000')            # mov eax,0xa
+    code += bytes.fromhex('0f05')                  # syscall (mprotect)
+    code += bytes.fromhex('85c0')                  # test eax,eax
+    code += bytes.fromhex('0f8500000000')          # jne done
+    fixups.append((len(code) - 4, 'done'))
 
 code += bytes.fromhex('8b03')                      # mov eax,[rbx]
 code += bytes.fromhex('89c1')                      # mov ecx,eax
@@ -132,6 +135,10 @@ for rel_off, target in fixups:
     from_next = cave_va + rel_off + 4
     to_va = cave_va + labels[target] if isinstance(target, str) else target
     code[rel_off:rel_off + 4] = rel32(from_next, to_va)
+# Overwrite a small fixed window so stale bytes from previous cave versions
+# do not appear as reachable disassembly artifacts.
+cave_span = max(len(code), 0x80)
+b[cave_off:cave_off + cave_span] = b'\xCC' * cave_span
 b[cave_off:cave_off + len(code)] = code
 
 func_off = va_to_off(func_va)

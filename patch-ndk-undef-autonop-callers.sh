@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Static patch for libndk_translation UndefinedInsn:
-# - make guest code page writable via mprotect syscall
-# - replace current undefined guest instruction with AArch64 NOP
+# - default: mprotect guest code page, then replace undefined guest instruction with AArch64 NOP
+# - optional (SKIP_MPROTECT=1): write directly without mprotect
 # - return 4 (AArch64 instruction width)
 #
 # This avoids caller-site x86 patching and stops infinite undefined-insn loops.
@@ -29,7 +29,8 @@ SYM="_ZN15ndk_translation13UndefinedInsnEm"
 #   mov eax,4
 #   pop rbx
 #   ret
-PATCH_HEX="534889fb4881e700f0ffffbe00100000ba07000000b80a0000000f0585c07506c7031f2003d5b8040000005bc3"
+PATCH_HEX_WITH_MPROTECT="534889fb4881e700f0ffffbe00100000ba07000000b80a0000000f0585c07506c7031f2003d5b8040000005bc3"
+PATCH_HEX_NO_MPROTECT="534889fbc7031f2003d5b8040000005bc3"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }
@@ -51,7 +52,7 @@ text_addr_off_hex() {
 }
 
 apply_patch_now() {
-  local sym_hex text_hex off_hex sym_dec text_dec off_dec file_off backup ts
+  local sym_hex text_hex off_hex sym_dec text_dec off_dec file_off backup ts patch_hex
   sym_hex="$(sym_addr_hex "$LIB" "$SYM")"
   [ -n "$sym_hex" ] || { echo "Could not find symbol: $SYM" >&2; exit 1; }
   read -r text_hex off_hex < <(text_addr_off_hex "$LIB")
@@ -67,8 +68,16 @@ apply_patch_now() {
   echo "[*] Backup: $backup"
   sudo cp -a "$LIB" "$backup"
 
+  if [ "${SKIP_MPROTECT:-0}" = "1" ]; then
+    patch_hex="$PATCH_HEX_NO_MPROTECT"
+    echo "[*] Using no-mprotect variant (SKIP_MPROTECT=1)"
+  else
+    patch_hex="$PATCH_HEX_WITH_MPROTECT"
+    echo "[*] Using default mprotect variant"
+  fi
+
   echo "[*] Patching $SYM at vaddr 0x${sym_hex} (file offset 0x$(printf '%x' "$file_off"))"
-  printf "$(echo "$PATCH_HEX" | sed 's/../\\x&/g')" | sudo dd of="$LIB" bs=1 seek="$file_off" conv=notrunc status=none
+  printf "$(echo "$patch_hex" | sed 's/../\\x&/g')" | sudo dd of="$LIB" bs=1 seek="$file_off" conv=notrunc status=none
 
   echo "[*] Verify disasm:"
   sudo objdump -d -Mintel --start-address=$((16#$sym_hex)) --stop-address=$((16#$sym_hex+0x40)) "$LIB"
