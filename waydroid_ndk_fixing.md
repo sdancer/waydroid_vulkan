@@ -1144,3 +1144,45 @@ Observed test output:
 - This binary uses Android packed relocations (`DT_ANDROID_RELA*`), not plain `DT_RELA`.
 - Full table relocation into new section would require rebuilding packed relocation payloads.
 - In-place patching of already-relocated slots avoids that complexity and is now functioning.
+
+## 2026-02-20 Follow-up 21: Add/Sub class-gated decode cave (no `UndefinedInsn` hook dependency)
+
+### Goal
+- Stop relying on patching `_ZN15ndk_translation13UndefinedInsnEm` for this opcode family.
+- Route from the normal decode support gate into a cave, then rejoin the normal decode flow when class/opcode match.
+- Keep the original undefined path for non-matching cases.
+
+### Normal flow traced for the known failing family
+- Decode gate in `InitInterpreter` block:
+  - `0x1e5fd3`: `test al,al`
+  - `0x1e5fd5`: `je 0x1e60b1` (original undefined path)
+  - `0x1e5fdb`: normal continuation
+- Downstream class handling in same block:
+  - `0x1e604e`: `cmp r13b,0x4` (Add/Sub-like class split)
+  - `0x1e6060`: `cmp al,0x2` then `je 0x1e69e4`
+  - `0x1e69e4`: normal implementation block for that case, then jumps back to shared completion (`0x1e683a`).
+
+### New patch logic in `patch-ndk-frsqrte-decode-shim.sh`
+- Patch site:
+  - `0x1e5fd5` (`je undef`) is replaced with `jmp 0x300000` (+`nop` padding).
+- Cave at `0x300000`:
+  1. If already supported (`al!=0`): jump to normal continuation `0x1e5fdb`.
+  2. Else read instruction (`[r14+8]`), mask with `0xfffff800`.
+  3. Compare against multiple opcode bases:
+     - `0x6ee1d800`, `0x2ea1d800`, `0x7ea1d800`, `0x7ee1d800`.
+  4. If no match: jump to original undefined target `0x1e60b1`.
+  5. If match: require Add/Sub-like class context:
+     - allow `r13b==0x4` or `r13b==0x8`.
+     - normalize `0x8 -> 0x4` (`mov r13b,0x4`) for consistent downstream handling.
+     - force supported (`mov al,1`) and jump to `0x1e5fdb`.
+- This preserves the stock control-flow shape for matched cases (rejoin before existing dispatch), instead of jumping through `UndefinedInsn`.
+
+### Implementation notes
+- Script now reuses an existing cave `LOAD` segment at `VA 0x300000` when present, instead of always rewriting `PT_NOTE`.
+- Cave region is pre-filled with `0xCC` before writing new stub bytes to avoid stale disassembly artifacts.
+
+### Active state after apply
+- Overlay translator hash after applying this decode-cave patch:
+  - `c1854eef9f62312e1b5947c63a98f540745acd6da20e0507f0fa459afcc00237`
+- Patch bytes at `0x1e5fd5`:
+  - `e926a0110090` (`jmp cave` + `nop`)

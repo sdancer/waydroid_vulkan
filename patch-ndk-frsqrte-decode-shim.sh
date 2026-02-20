@@ -7,6 +7,10 @@ CAVE_VA="${CAVE_VA:-0x300000}"
 CAVE_SIZE="${CAVE_SIZE:-0x2000}"
 
 # Decode function addresses in lib virtual-address space.
+# We hook the "supported?" branch and route through a cave:
+# - normal supported path falls through untouched
+# - for selected opcodes, only force support when class context is AddSub-like
+# - otherwise preserve original UndefinedInsn path
 PATCH_SITE=0x1e5fd5       # test al,al ; je undef
 TARGET_FALLTHROUGH=0x1e5fdb
 TARGET_UNDEFINED=0x1e60b1
@@ -53,7 +57,8 @@ PATCH_SITE=0x1e5fd5
 TARGET_FALLTHROUGH=0x1e5fdb
 TARGET_UNDEFINED=0x1e60b1
 
-# opcode masks/values (mask low 11 bits for register fields)
+# Opcode masks/values (mask low 11 bits for register fields).
+# We compare multiple instruction forms that map to the same family.
 MASK = 0xfffff800
 VALUES = [0x6ee1d800, 0x2ea1d800, 0x7ea1d800, 0x7ee1d800]
 
@@ -70,26 +75,31 @@ def va_to_off(va):
     # .text VA base 0x0c9370 at file off 0x0c8370
     return va - 0x0c9370 + 0x0c8370
 
-# Reuse PT_NOTE as an RX cave segment.
+# Reuse an existing cave LOAD segment when present, otherwise reuse PT_NOTE.
 note_i = None
+existing_cave = None
 for i in range(e_phnum):
     off = e_phoff + i * e_phentsz
-    p_type, p_flags = struct.unpack_from('<II', b, off)
+    p_type, p_flags, p_offset, p_vaddr, _p_paddr, p_filesz, _p_memsz, _p_align = struct.unpack_from('<IIQQQQQQ', b, off)
+    if p_type == 1 and p_vaddr == cave_va and p_filesz > 0:
+        existing_cave = (p_offset, p_filesz)
+        break
     if p_type == 4:  # PT_NOTE
         note_i = i
-        break
-if note_i is None:
-    raise SystemExit('PT_NOTE not found')
-
-align = 0x1000
-new_off = (len(b) + align - 1) & ~(align - 1)
-need = new_off + cave_size
-if len(b) < need:
-    b.extend(b'\x00' * (need - len(b)))
-
-ph = e_phoff + note_i * e_phentsz
-struct.pack_into('<IIQQQQQQ', b, ph,
-                 1, 0x5, new_off, cave_va, cave_va, cave_size, cave_size, align)
+if existing_cave is not None:
+    new_off, cave_avail = existing_cave
+else:
+    if note_i is None:
+        raise SystemExit('Neither existing cave LOAD nor PT_NOTE found')
+    align = 0x1000
+    new_off = (len(b) + align - 1) & ~(align - 1)
+    need = new_off + cave_size
+    if len(b) < need:
+        b.extend(b'\x00' * (need - len(b)))
+    cave_avail = cave_size
+    ph = e_phoff + note_i * e_phentsz
+    struct.pack_into('<IIQQQQQQ', b, ph,
+                     1, 0x5, new_off, cave_va, cave_va, cave_size, cave_size, align)
 
 # Build cave stub with reloc patching.
 code = bytearray()
@@ -114,6 +124,15 @@ for v in VALUES:
 code += b'\xE9\x00\x00\x00\x00'; fixups.append((len(code)-4, TARGET_UNDEFINED))
 
 labels['force'] = len(code)
+# Only force support in the same class context that reaches AddSub handling.
+# r13b is the element-width/class selector in this decode path.
+code += b'\x41\x80\xFD\x04'                      # cmp r13b,0x4
+code += b'\x0F\x84\x0A\x00\x00\x00'              # je force_ok
+code += b'\x41\x80\xFD\x08'                      # cmp r13b,0x8
+code += b'\x0F\x85\x00\x00\x00\x00'              # jne undef
+fixups.append((len(code)-4, TARGET_UNDEFINED))
+code += b'\x41\xB5\x04'                          # mov r13b,0x4 (normalize to AddSub class)
+# force_ok:
 code += b'\xB0\x01'  # mov al,1
 labels['supported'] = len(code)
 code += b'\xE9\x00\x00\x00\x00'; fixups.append((len(code)-4, TARGET_FALLTHROUGH))
@@ -135,8 +154,10 @@ for rel_off, target in fixups:
     code[rel_off:rel_off+4] = rel32(from_next, to_va)
 
 # Write code into cave
-if len(code) > cave_size:
+if len(code) > cave_avail:
     raise SystemExit('cave code too large')
+cave_span = max(len(code), 0x100)
+b[new_off:new_off+cave_span] = b'\xCC' * cave_span
 b[new_off:new_off+len(code)] = code
 
 # Patch decode branch: replace `je 0x1e60b1` (6 bytes) with `jmp cave` + nop.
@@ -151,7 +172,8 @@ jmp[1:5] = rel32(from_next, cave_va)
 b[site_off:site_off+6] = jmp
 
 lib.write_bytes(bytes(b))
-print(f'patched: note->load idx={note_i} cave_off=0x{new_off:x} cave_va=0x{cave_va:x} cave_size=0x{cave_size:x} code_len=0x{len(code):x}')
+where = f'existing_load cave_off=0x{new_off:x}' if existing_cave is not None else f'note->load idx={note_i} cave_off=0x{new_off:x}'
+print(f'patched: {where} cave_va=0x{cave_va:x} cave_avail=0x{cave_avail:x} code_len=0x{len(code):x}')
 print(f'patch_site old={site.hex()} new={jmp.hex()}')
 PY
 
